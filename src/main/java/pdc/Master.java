@@ -28,7 +28,16 @@ public class Master {
 
     // Worker registry: workerId -> socket
     private final Map<String, Socket> workers = new ConcurrentHashMap<>();
+    private final Map<String, PrintWriter> workerWriters = new ConcurrentHashMap<>();
+    private final Map<Socket, String> socketToWorkerId = new ConcurrentHashMap<>();
     private final Map<String, Long> lastHeartbeat = new ConcurrentHashMap<>();
+
+    // Pending tasks: taskId -> client writer
+    private final Map<String, PrintWriter> pendingTaskClient = new ConcurrentHashMap<>();
+    private final Map<String, String> pendingTaskAssignedWorker = new ConcurrentHashMap<>();
+    private final Map<String, String> pendingTaskPayload = new ConcurrentHashMap<>();
+    private final java.util.concurrent.atomic.AtomicInteger rr = new java.util.concurrent.atomic.AtomicInteger(0);
+    private String studentIdEnv = System.getenv("STUDENT_ID");
     private volatile ServerSocket serverSocket;
 
     /**
@@ -118,68 +127,199 @@ public class Master {
             try (BufferedReader in = new BufferedReader(
                     new InputStreamReader(client.getInputStream(), StandardCharsets.UTF_8));
                     PrintWriter out = new PrintWriter(client.getOutputStream(), true, StandardCharsets.UTF_8)) {
-                String line;
-                while ((line = in.readLine()) != null) {
-                    try {
-                        Message msg = Message.parse(line);
-                        if (msg == null)
-                            continue;
 
-                        if ("REGISTER_WORKER".equals(msg.messageType)) {
-                            String id = msg.payload == null ? "" : msg.payload;
-                            workers.put(id, client);
-                            lastHeartbeat.put(id, System.currentTimeMillis());
-                            Message ack = new Message();
-                            ack.messageType = "WORKER_ACK";
-                            ack.payload = "ok";
-                            out.println(ack.toJson());
-                        } else if ("HEARTBEAT".equals(msg.messageType)) {
-                            String id = msg.payload == null ? "" : msg.payload;
-                            lastHeartbeat.put(id, System.currentTimeMillis());
-                            Message ack = new Message();
-                            ack.messageType = "HEARTBEAT_ACK";
-                            ack.payload = "pong";
-                            out.println(ack.toJson());
-                        } else if ("RPC_REQUEST".equals(msg.messageType)) {
-                            // payload: taskId;taskType;payload
-                            String p = msg.payload == null ? "" : msg.payload;
-                            int first = p.indexOf(';');
-                            int second = p.indexOf(';', first + 1);
-                            if (first > 0 && second > first) {
-                                String taskId = p.substring(0, first);
-                                String taskType = p.substring(first + 1, second);
-                                String taskPayload = p.substring(second + 1);
+                StringBuilder buffer = new StringBuilder();
+                int braceDepth = 0;
+                int r;
+                while ((r = in.read()) != -1) {
+                    char c = (char) r;
+                    buffer.append(c);
+                    if (c == '{')
+                        braceDepth++;
+                    if (c == '}')
+                        braceDepth--;
+                    if (braceDepth == 0 && buffer.length() > 0) {
+                        String raw = buffer.toString().trim();
+                        buffer.setLength(0);
+                        try {
+                            if (raw.isEmpty())
+                                continue;
+                            Message msg = Message.parse(raw);
+                            if (msg == null)
+                                continue;
 
-                                // Handle MATRIX_MULTIPLY inline for the harness
-                                taskPool.submit(() -> {
-                                    try {
-                                        if ("MATRIX_MULTIPLY".equals(taskType)) {
-                                            String result = handleMatrixMultiply(taskPayload);
-                                            Message resp = new Message();
-                                            resp.messageType = "TASK_COMPLETE";
-                                            resp.payload = taskId + ";" + result;
-                                            out.println(resp.toJson());
+                            if ("REGISTER_WORKER".equals(msg.messageType)) {
+                                String id = msg.payload == null ? "" : msg.payload;
+                                workers.put(id, client);
+                                workerWriters.put(id, out);
+                                socketToWorkerId.put(client, id);
+                                lastHeartbeat.put(id, System.currentTimeMillis());
+                                Message ack = new Message();
+                                ack.messageType = "WORKER_ACK";
+                                ack.studentId = studentIdEnv;
+                                ack.payload = "ok";
+                                out.println(ack.toJson());
+                            } else if ("HEARTBEAT".equals(msg.messageType)) {
+                                String id = msg.payload == null ? "" : msg.payload;
+                                lastHeartbeat.put(id, System.currentTimeMillis());
+                                Message ack = new Message();
+                                ack.messageType = "HEARTBEAT_ACK";
+                                ack.payload = "pong";
+                                out.println(ack.toJson());
+                            } else if ("RPC_REQUEST".equals(msg.messageType)) {
+                                String p = msg.payload == null ? "" : msg.payload;
+                                int first = p.indexOf(';');
+                                int second = p.indexOf(';', first + 1);
+                                if (first > 0 && second > first) {
+                                    String taskId = p.substring(0, first);
+                                    String taskType = p.substring(first + 1, second);
+                                    String taskPayload = p.substring(second + 1);
+
+                                    if (workers.isEmpty()) {
+                                        // do locally
+                                        taskPool.submit(() -> {
+                                            try {
+                                                if ("MATRIX_MULTIPLY".equals(taskType)) {
+                                                    String result = handleMatrixMultiply(taskPayload);
+                                                    Message resp = new Message();
+                                                    resp.messageType = "TASK_COMPLETE";
+                                                    resp.payload = taskId + ";" + result;
+                                                    out.println(resp.toJson());
+                                                } else {
+                                                    Message resp = new Message();
+                                                    resp.messageType = "TASK_ERROR";
+                                                    resp.payload = taskId + ";unsupported";
+                                                    out.println(resp.toJson());
+                                                }
+                                            } catch (Exception ex) {
+                                                Message resp = new Message();
+                                                resp.messageType = "TASK_ERROR";
+                                                resp.payload = taskId + ";" + ex.getMessage();
+                                                out.println(resp.toJson());
+                                            }
+                                        });
+                                    } else {
+                                        String[] ids = workers.keySet().toArray(new String[0]);
+                                        if (ids.length == 0) {
+                                            // fall back to local
                                         } else {
-                                            Message resp = new Message();
-                                            resp.messageType = "TASK_ERROR";
-                                            resp.payload = taskId + ";unsupported";
-                                            out.println(resp.toJson());
+                                            int idx = Math.abs(rr.getAndIncrement()) % ids.length;
+                                            String workerId = ids[idx];
+                                            PrintWriter wout = workerWriters.get(workerId);
+                                            if (wout != null) {
+                                                pendingTaskClient.put(taskId, out);
+                                                pendingTaskAssignedWorker.put(taskId, workerId);
+                                                Message forward = new Message();
+                                                forward.messageType = "RPC_REQUEST";
+                                                forward.payload = taskId + ";" + taskType + ";" + taskPayload;
+                                                pendingTaskPayload.put(taskId, forward.toJson());
+                                                wout.println(forward.toJson());
+                                            } else {
+                                                // fallback local
+                                                taskPool.submit(() -> {
+                                                    try {
+                                                        if ("MATRIX_MULTIPLY".equals(taskType)) {
+                                                            String result = handleMatrixMultiply(taskPayload);
+                                                            Message resp = new Message();
+                                                            resp.messageType = "TASK_COMPLETE";
+                                                            resp.payload = taskId + ";" + result;
+                                                            out.println(resp.toJson());
+                                                        } else {
+                                                            Message resp = new Message();
+                                                            resp.messageType = "TASK_ERROR";
+                                                            resp.payload = taskId + ";unsupported";
+                                                            out.println(resp.toJson());
+                                                        }
+                                                    } catch (Exception ex) {
+                                                        Message resp = new Message();
+                                                        resp.messageType = "TASK_ERROR";
+                                                        resp.payload = taskId + ";" + ex.getMessage();
+                                                        out.println(resp.toJson());
+                                                    }
+                                                });
+                                            }
                                         }
-                                    } catch (Exception ex) {
-                                        Message resp = new Message();
-                                        resp.messageType = "TASK_ERROR";
-                                        resp.payload = taskId + ";" + ex.getMessage();
-                                        out.println(resp.toJson());
                                     }
-                                });
+                                }
+                            } else if ("TASK_COMPLETE".equals(msg.messageType)
+                                    || "TASK_ERROR".equals(msg.messageType)) {
+                                String p = msg.payload == null ? "" : msg.payload;
+                                int idx = p.indexOf(';');
+                                String taskId = idx > 0 ? p.substring(0, idx) : p;
+                                PrintWriter clientOut = pendingTaskClient.remove(taskId);
+                                pendingTaskAssignedWorker.remove(taskId);
+                                pendingTaskPayload.remove(taskId);
+                                if (clientOut != null) {
+                                    clientOut.println(msg.toJson());
+                                }
                             }
+                        } catch (Exception ex) {
+                            // ignore malformed messages
                         }
-                    } catch (Exception ex) {
-                        // ignore malformed messages
                     }
                 }
             } catch (IOException e) {
                 // client disconnected
+            } finally {
+                // cleanup on disconnect: if worker, try to reassign its tasks
+                try {
+                    String wid = socketToWorkerId.remove(client);
+                    if (wid != null) {
+                        workers.remove(wid);
+                        workerWriters.remove(wid);
+                        lastHeartbeat.remove(wid);
+                        // reassign tasks assigned to this worker
+                        for (Map.Entry<String, String> ent : new java.util.ArrayList<>(
+                                pendingTaskAssignedWorker.entrySet())) {
+                            String taskId = ent.getKey();
+                            String assigned = ent.getValue();
+                            if (wid.equals(assigned)) {
+                                pendingTaskAssignedWorker.remove(taskId);
+                                String payloadJson = pendingTaskPayload.get(taskId);
+                                PrintWriter clientOut = pendingTaskClient.get(taskId);
+                                String[] ids = workers.keySet().toArray(new String[0]);
+                                if (ids.length == 0) {
+                                    // execute locally
+                                    if (clientOut != null && payloadJson != null) {
+                                        try {
+                                            Message orig = Message.parse(payloadJson);
+                                            String p = orig.payload == null ? "" : orig.payload;
+                                            int first = p.indexOf(';');
+                                            int second = p.indexOf(';', first + 1);
+                                            String taskType = p.substring(first + 1, second);
+                                            String taskPayload = p.substring(second + 1);
+                                            if ("MATRIX_MULTIPLY".equals(taskType)) {
+                                                String result = handleMatrixMultiply(taskPayload);
+                                                Message resp = new Message();
+                                                resp.messageType = "TASK_COMPLETE";
+                                                resp.payload = taskId + ";" + result;
+                                                clientOut.println(resp.toJson());
+                                            } else {
+                                                Message resp = new Message();
+                                                resp.messageType = "TASK_ERROR";
+                                                resp.payload = taskId + ";no_workers";
+                                                clientOut.println(resp.toJson());
+                                            }
+                                        } catch (Exception ex2) {
+                                            // ignore
+                                        }
+                                    }
+                                } else {
+                                    int idx2 = Math.abs(rr.getAndIncrement()) % ids.length;
+                                    String newWorker = ids[idx2];
+                                    PrintWriter wout = workerWriters.get(newWorker);
+                                    if (wout != null && payloadJson != null) {
+                                        pendingTaskAssignedWorker.put(taskId, newWorker);
+                                        wout.println(payloadJson);
+                                    }
+                                }
+                            }
+                        }
+                    }
+                } catch (Exception ex) {
+                    // swallow
+                }
+
             }
         });
     }
