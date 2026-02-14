@@ -81,13 +81,26 @@ public class Message {
     private static String getRaw(String json, String key) {
         String marker = '"' + key + '"' + ":";
         int i = json.indexOf(marker);
-        if (i < 0) return null;
+        if (i < 0)
+            return null;
         int j = i + marker.length();
         // skip whitespace
-        while (j < json.length() && Character.isWhitespace(json.charAt(j))) j++;
+        while (j < json.length() && Character.isWhitespace(json.charAt(j)))
+            j++;
         int end = j;
-        while (end < json.length() && (Character.isDigit(json.charAt(end)) || json.charAt(end) == '-')) end++;
-        return json.substring(j, end).replaceAll("[\\,\s}]$", "");
+        while (end < json.length() && (Character.isDigit(json.charAt(end)) || json.charAt(end) == '-'))
+            end++;
+        String sub = json.substring(j, end);
+        // strip trailing comma, whitespace or closing brace if present
+        while (!sub.isEmpty()) {
+            char c = sub.charAt(sub.length() - 1);
+            if (c == ',' || Character.isWhitespace(c) || c == '}') {
+                sub = sub.substring(0, sub.length() - 1);
+            } else {
+                break;
+            }
+        }
+        return sub;
     }
 
     private static String getString(String json, String key) {
