@@ -87,7 +87,7 @@ public class Message {
         while (j < json.length() && Character.isWhitespace(json.charAt(j))) j++;
         int end = j;
         while (end < json.length() && (Character.isDigit(json.charAt(end)) || json.charAt(end) == '-')) end++;
-        return json.substring(j, end).replaceAll("[\\\\,\\s}]$", "");
+        return json.substring(j, end).replaceAll("[\\,\s}]$", "");
     }
 
     private static String getString(String json, String key) {
