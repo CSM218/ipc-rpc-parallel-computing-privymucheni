@@ -37,6 +37,28 @@ public class Message {
     }
 
     /**
+     * Return JSON bytes prefixed with a 4-byte big-endian length for framing.
+     */
+    public byte[] framedBytes() {
+        byte[] body = pack();
+        int len = body.length;
+        byte[] out = new byte[4 + len];
+        out[0] = (byte) ((len >> 24) & 0xFF);
+        out[1] = (byte) ((len >> 16) & 0xFF);
+        out[2] = (byte) ((len >> 8) & 0xFF);
+        out[3] = (byte) (len & 0xFF);
+        System.arraycopy(body, 0, out, 4, len);
+        return out;
+    }
+
+    /**
+     * Parse a message from framed bytes (body only, no length prefix required).
+     */
+    public static Message fromBodyBytes(byte[] body) {
+        return unpack(body);
+    }
+
+    /**
      * Serialize to a simple JSON string. This is intentionally tiny and
      * avoids external dependencies.
      */
