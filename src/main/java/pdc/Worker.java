@@ -1,9 +1,11 @@
 package pdc;
 
-import java.io.BufferedReader;
+import java.io.BufferedInputStream;
+import java.io.DataInputStream;
+import java.io.DataOutputStream;
 import java.io.IOException;
-import java.io.InputStreamReader;
-import java.io.PrintWriter;
+import java.io.InputStream;
+import java.io.OutputStream;
 import java.net.InetSocketAddress;
 import java.net.Socket;
 import java.nio.charset.StandardCharsets;
@@ -22,68 +24,96 @@ public class Worker {
     private final ExecutorService exec = Executors
             .newFixedThreadPool(Math.max(2, Runtime.getRuntime().availableProcessors()));
     private volatile boolean running = true;
+    private Socket socket;
+    private Thread heartbeatThread;
 
     /**
      * Connects to the Master and initiates the registration handshake.
      * The handshake must exchange 'Identity' and 'Capability' sets.
      */
-    public void joinCluster(String masterHost, int port) {
+    public boolean joinCluster(String masterHost, int port) {
         String workerIdEnv = System.getenv("WORKER_ID");
         final String workerId = (workerIdEnv == null) ? "worker-unknown" : workerIdEnv;
         String studentId = System.getenv("STUDENT_ID");
 
-        try (Socket sock = new Socket()) {
-            sock.connect(new InetSocketAddress(masterHost, port), 5000);
-            sock.setKeepAlive(true);
+        try {
+            this.socket = new Socket();
+            this.socket.connect(new InetSocketAddress(masterHost, port), 5000);
+            this.socket.setKeepAlive(true);
 
-            try (BufferedReader in = new BufferedReader(
-                    new InputStreamReader(sock.getInputStream(), StandardCharsets.UTF_8));
-                    PrintWriter out = new PrintWriter(sock.getOutputStream(), true, StandardCharsets.UTF_8)) {
+            InputStream is = new BufferedInputStream(this.socket.getInputStream());
+            DataInputStream din = new DataInputStream(is);
+            OutputStream os = this.socket.getOutputStream();
+            DataOutputStream dout = new DataOutputStream(os);
 
-                // Send registration
-                Message reg = new Message();
-                reg.messageType = "REGISTER_WORKER";
-                reg.studentId = studentId;
-                reg.payload = workerId;
-                out.println(reg.toJson());
+            // Send registration
+            Message reg = new Message();
+            reg.messageType = "REGISTER_WORKER";
+            reg.studentId = studentId;
+            reg.payload = workerId;
+            dout.write(reg.framedBytes());
+            dout.flush();
 
-                // Start heartbeat sender
-                Thread heartbeat = new Thread(() -> {
-                    while (running && !sock.isClosed()) {
+            // Wait for ACK
+            int len = din.readInt();
+            if (len <= 0 || len > 10_000_000)
+                return false;
+            byte[] body = new byte[len];
+            din.readFully(body);
+            Message ack = Message.fromBodyBytes(body);
+            if (ack == null || !"WORKER_ACK".equals(ack.messageType))
+                return false;
+
+            this.running = true;
+
+            // Heartbeat sender (does not consume responses)
+            heartbeatThread = new Thread(() -> {
+                while (running) {
+                    try {
+                        Message hb = new Message();
+                        hb.messageType = "HEARTBEAT";
+                        hb.studentId = studentId;
+                        hb.payload = workerId;
                         try {
-                            Message hb = new Message();
-                            hb.messageType = "HEARTBEAT";
-                            hb.studentId = studentId;
-                            hb.payload = workerId;
-                            out.println(hb.toJson());
-                            Thread.sleep(1000);
-                        } catch (InterruptedException e) {
-                            Thread.currentThread().interrupt();
+                            dout.write(hb.framedBytes());
+                            dout.flush();
+                        } catch (IOException ignore) {
+                        }
+                        Thread.sleep(1000);
+                    } catch (InterruptedException e) {
+                        Thread.currentThread().interrupt();
+                        break;
+                    }
+                }
+            });
+            heartbeatThread.setDaemon(true);
+            heartbeatThread.start();
+
+            // Reader thread: consumes messages from master
+            Thread reader = new Thread(() -> {
+                try {
+                    while (running) {
+                        int l;
+                        try {
+                            l = din.readInt();
+                        } catch (IOException e) {
                             break;
                         }
-                    }
-                });
-                heartbeat.setDaemon(true);
-                heartbeat.start();
-
-                // Read loop: handle commands from master
-                String line;
-                while (running && (line = in.readLine()) != null) {
-                    try {
-                        Message msg = Message.parse(line);
-                        if (msg == null)
+                        if (l <= 0 || l > 10_000_000)
+                            break;
+                        byte[] b = new byte[l];
+                        din.readFully(b);
+                        Message m = Message.fromBodyBytes(b);
+                        if (m == null)
                             continue;
-
-                        if ("RPC_REQUEST".equals(msg.messageType)) {
-                            final String p = msg.payload == null ? "" : msg.payload;
+                        if ("RPC_REQUEST".equals(m.messageType)) {
+                            final String p = m.payload == null ? "" : m.payload;
                             int first = p.indexOf(';');
                             int second = p.indexOf(';', first + 1);
                             if (first > 0 && second > first) {
                                 final String taskId = p.substring(0, first);
                                 final String taskType = p.substring(first + 1, second);
                                 final String taskPayload = p.substring(second + 1);
-
-                                // Execute asynchronously
                                 exec.submit(() -> {
                                     try {
                                         if ("MATRIX_MULTIPLY".equals(taskType)) {
@@ -92,36 +122,47 @@ public class Worker {
                                             resp.messageType = "TASK_COMPLETE";
                                             resp.studentId = studentId;
                                             resp.payload = taskId + ";" + result;
-                                            out.println(resp.toJson());
+                                            try {
+                                                dout.write(resp.framedBytes());
+                                                dout.flush();
+                                            } catch (IOException ignore) {
+                                            }
                                         } else {
                                             Message resp = new Message();
                                             resp.messageType = "TASK_ERROR";
                                             resp.studentId = studentId;
                                             resp.payload = taskId + ";unsupported";
-                                            out.println(resp.toJson());
+                                            try {
+                                                dout.write(resp.framedBytes());
+                                                dout.flush();
+                                            } catch (IOException ignore) {
+                                            }
                                         }
                                     } catch (Exception ex) {
                                         Message resp = new Message();
                                         resp.messageType = "TASK_ERROR";
                                         resp.studentId = studentId;
                                         resp.payload = taskId + ";" + ex.getMessage();
-                                        out.println(resp.toJson());
+                                        try {
+                                            dout.write(resp.framedBytes());
+                                            dout.flush();
+                                        } catch (IOException ignore) {
+                                        }
                                     }
                                 });
                             }
-                        } else if ("HEARTBEAT_ACK".equals(msg.messageType) || "WORKER_ACK".equals(msg.messageType)) {
-                            // ignore or log
                         }
-                    } catch (Exception ex) {
-                        // ignore malformed
                     }
+                } catch (Exception e) {
+                    // end
                 }
+            });
+            reader.setDaemon(true);
+            reader.start();
 
-            }
+            return true;
         } catch (IOException e) {
-            // connection failed; exit or retry is possible
-        } finally {
-            shutdown();
+            return false;
         }
     }
 
@@ -192,11 +233,23 @@ public class Worker {
 
     public void shutdown() {
         running = false;
+        if (heartbeatThread != null) {
+            try {
+                heartbeatThread.interrupt();
+            } catch (Exception ignore) {
+            }
+        }
         exec.shutdownNow();
         try {
             exec.awaitTermination(1, TimeUnit.SECONDS);
         } catch (InterruptedException e) {
             Thread.currentThread().interrupt();
+        }
+        if (socket != null) {
+            try {
+                socket.close();
+            } catch (IOException ignore) {
+            }
         }
     }
 }
