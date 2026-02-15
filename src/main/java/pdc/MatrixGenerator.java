@@ -11,8 +11,7 @@ public class MatrixGenerator {
     private static final Random random = new Random();
 
     /**
-     * Generates a random matrix of specified dimensions.
-     * 
+
      * @param rows     number of rows
      * @param cols     number of columns
      * @param maxValue maximum value for matrix elements (exclusive)
@@ -29,8 +28,7 @@ public class MatrixGenerator {
     }
 
     /**
-     * Generates an identity matrix of specified size.
-     * 
+     *
      * @param size the dimension of the identity matrix
      * @return an identity matrix
      */
@@ -43,7 +41,6 @@ public class MatrixGenerator {
     }
 
     /**
-     * Generates a matrix filled with a specific value.
      * 
      * @param rows  number of rows
      * @param cols  number of columns
